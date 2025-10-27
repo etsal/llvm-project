@@ -436,6 +436,11 @@ static cl::opt<AsanDtorKind> ClOverrideDestructorKind(
                           "Use global destructors")),
     cl::init(AsanDtorKind::Invalid), cl::Hidden);
 
+static cl::list<int> ClAddrSpaces(
+    "asan-instrument-address-spaces",
+    cl::desc("Only instrument variables in the specified address spaces."),
+    cl::Hidden, cl::CommaSeparated, cl::ZeroOrMore);
+
 // Debug flags.
 
 static cl::opt<int> ClDebug("asan-debug", cl::desc("debug"), cl::Hidden,
@@ -1358,9 +1363,24 @@ static bool GlobalWasGeneratedByCompiler(GlobalVariable *G) {
 static bool isUnsupportedAMDGPUAddrspace(Value *Addr) {
   Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
   unsigned int AddrSpace = PtrTy->getPointerAddressSpace();
+  // Globals in address space 1 and 4 are supported for AMDGPU.
   if (AddrSpace == 3 || AddrSpace == 5)
     return true;
   return false;
+}
+
+static bool isSupportedAddrspace(const Triple &TargetTriple, Value *Addr) {
+  Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+  unsigned int AddrSpace = PtrTy->getPointerAddressSpace();
+
+  if (!ClAddrSpaces.empty())
+    return std::find(ClAddrSpaces.begin(), ClAddrSpaces.end(), AddrSpace) !=
+           ClAddrSpaces.end();
+
+  if (TargetTriple.isAMDGPU())
+    return !isUnsupportedAMDGPUAddrspace(Addr);
+
+  return AddrSpace == 0;
 }
 
 Value *AddressSanitizer::memToShadow(Value *Shadow, IRBuilder<> &IRB) {
@@ -1426,10 +1446,9 @@ bool AddressSanitizer::isInterestingAlloca(const AllocaInst &AI) {
 }
 
 bool AddressSanitizer::ignoreAccess(Instruction *Inst, Value *Ptr) {
-  // Instrument accesses from different address spaces only for AMDGPU.
-  Type *PtrTy = cast<PointerType>(Ptr->getType()->getScalarType());
-  if (PtrTy->getPointerAddressSpace() != 0 &&
-      !(TargetTriple.isAMDGPU() && !isUnsupportedAMDGPUAddrspace(Ptr)))
+  // Check whether the target supports sanitizing the address space
+  // of the pointer.
+  if (!isSupportedAddrspace(TargetTriple, Ptr))
     return true;
 
   // Ignore swifterror addresses.
@@ -2092,9 +2111,7 @@ bool ModuleAddressSanitizer::shouldInstrumentGlobal(GlobalVariable *G) const {
     return false;
   if (!Ty->isSized()) return false;
   if (!G->hasInitializer()) return false;
-  // Globals in address space 1 and 4 are supported for AMDGPU.
-  if (G->getAddressSpace() &&
-      !(TargetTriple.isAMDGPU() && !isUnsupportedAMDGPUAddrspace(G)))
+  if (!isSupportedAddrspace(TargetTriple, G))
     return false;
   if (GlobalWasGeneratedByCompiler(G)) return false; // Our own globals.
   // Two problems with thread-locals:
